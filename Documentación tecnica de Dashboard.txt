@@ -1,0 +1,586 @@
+# Especificación de Base de Datos — BDP Dashboard
+
+Este documento describe un esquema de base de datos completamente normalizado para el sistema BDP Dashboard (Frontend React), inferido a partir del análisis de la estructura del proyecto, componentes UI, hooks y flujos de datos utilizados.
+
+- Proyecto analizado: `Frontend/src`
+- Fuentes clave:
+  - Transacciones: `pages/hook/useTransactions.ts`, `components/transacciones/*`, `pages/ui/TransactionExplorer.tsx`
+  - Alertas: `pages/hook/useAlerts.ts`, `components/alertas/*`, `pages/ui/AlertasImport.tsx`
+  - Usuarios/Configuración/Auditoría: `pages/hook/useConfiguracion.tsx`, `components/configuracion/*`, `pages/ui/Configuracion.tsx`
+  - Perfil: `pages/hook/usePerfil.ts`, `components/perfil/*`, `pages/ui/Perfil.tsx`
+  - Modelos y Entrenamiento: `pages/hook/useModelos.tsx`, `components/modelos/*`, `pages/ui/Modelos.tsx`
+  - Acceso/Autenticación: `auth/ui/LoginScreen.tsx`, `auth/hook/useFaceCapture.ts`, `components/login_registro/*`
+
+## Principios de diseño
+
+- Tipos pensados para PostgreSQL: `int4`, `varchar(n)`, `text`, `numeric(p,s)`, `timestamptz`, `bool`, `jsonb`, `enum`.
+- Integridad referencial estricta en entidades críticas (usuarios, transacciones). 
+- Preservación histórica: transacciones y auditorías no se borran; se marcan estados y se registran en tablas de control (`DATOS_DESACTIVADOS`, `DATOS_ELIMINADOS`).
+- Campos sensibles (p.ej. tarjetas) se almacenan minimizados (no PAN completo) y con enmascaramiento.
+
+## Tabla: TARJETAS
+
+Breve: Almacena tarjetas asociadas a usuarios para compras/transacciones; no guarda PAN completo.
+
+Campos:
+- `id` int4 PK, no nulo — identificador de tarjeta.
+- `usuario_id` int4 FK→`REGISTRO_USUARIOS.id` ON DELETE RESTRICT, ON UPDATE CASCADE — dueño.
+- `last4` varchar(4) no nulo — últimos 4 dígitos.
+- `brand` varchar(20) no nulo — marca (Visa, MasterCard, etc.).
+- `exp_month` int4 no nulo — 1–12.
+- `exp_year` int4 no nulo — YYYY.
+- `status` enum('Activa','Bloqueada','Expirada') no nulo (default 'Activa').
+- `created_at` timestamptz no nulo — alta.
+- `updated_at` timestamptz no nulo — modificación.
+
+Relaciones:
+- 1:N con `TRANSACCIONES` vía `tarjeta_id`.
+
+Ejemplo JSON:
+{
+  "id": 10,
+  "usuario_id": 101,
+  "last4": "1234",
+  "brand": "Visa",
+  "exp_month": 12,
+  "exp_year": 2026,
+  "status": "Activa",
+  "created_at": "2024-03-01T10:00:00Z",
+  "updated_at": "2024-10-01T10:00:00Z"
+}
+
+## Tabla: REGISTRO_USUARIOS
+
+Breve: Gestión de identidad, permisos y estado de usuarios.
+
+Campos:
+- `id` varchar(16) PK, no nulo — p.ej. `u-001` (según Frontend).
+- `dni` varchar(8) único, no nulo — documento.
+- `nombres` varchar(80) no nulo.
+- `apellidos` varchar(120) no nulo.
+- `rol` enum('Administrador','Analista') no nulo.
+- `estado` enum('Activo','Inactivo') no nulo.
+- `email` varchar(120) nulo — contacto.
+- `created_at` timestamptz no nulo — fecha de registro.
+- `face_registered` bool no nulo default false — bandera de registro facial.
+
+Relaciones:
+- 1:N con `TARJETAS`, `TRANSACCIONES`, `AUDITORIA_SISTEMA`, `ALERTA_AUDITORIAS`, `LISTA_TAREAS`, `REPORTES`, `LOGS`.
+
+Ejemplo JSON:
+{
+  "id": "u-002",
+  "dni": "87654321",
+  "nombres": "Elena",
+  "apellidos": "Martínez Díaz",
+  "rol": "Analista",
+  "estado": "Activo",
+  "email": "elena.martinez@example.com",
+  "created_at": "2025-10-05T09:20:00Z",
+  "face_registered": true
+}
+
+## Tabla: TRANSACCIONES
+
+Breve: Registro principal de transacciones (hooks `useTransactions` y alertas).
+
+Campos:
+- `id` int4 PK, no nulo.
+- `usuario_id` int4 FK→`REGISTRO_USUARIOS.id` ON DELETE RESTRICT, ON UPDATE CASCADE.
+- `tarjeta_id` int4 FK→`TARJETAS.id` ON DELETE SET NULL, ON UPDATE CASCADE — preserva transacciones si se elimina tarjeta.
+- `cuenta` varchar(120) no nulo — nombre cliente/cuenta (según UI).
+- `monto_total` numeric(12,2) no nulo.
+- `fecha_hora` timestamptz no nulo.
+- `estado` enum('PENDIENTE','COMPLETADA','CANCELADA','RECHAZADA') no nulo.
+- `es_fraude` bool no nulo.
+- `score_fraude` int4 no nulo (0–100).
+- `pais` varchar(64) no nulo.
+- `tipo_comercio` varchar(64) no nulo.
+
+Relaciones:
+- 1:N con `DETALLE_TRANSACCIONES`.
+- 1:1/N con `ANALISIS_FRAUDE` (una fila por transacción, o histórico por versiones de modelo).
+- 1:N con `ALERTA_REGISTROS`.
+
+Ejemplo JSON:
+{
+  "id": 44,
+  "usuario_id": 106,
+  "tarjeta_id": 60,
+  "cuenta": "Rosa Mendoza",
+  "monto_total": 580.0,
+  "fecha_hora": "2024-03-18T11:00:00Z",
+  "estado": "PENDIENTE",
+  "es_fraude": false,
+  "score_fraude": 55,
+  "pais": "Chile",
+  "tipo_comercio": "Banca"
+}
+
+## Tabla: DETALLE_TRANSACCIONES
+
+Breve: Ítems de línea asociados a una transacción (productos/servicios). 
+
+Campos:
+- `id` int4 PK, no nulo.
+- `transaccion_id` int4 FK→`TRANSACCIONES.id` ON DELETE CASCADE, ON UPDATE CASCADE.
+- `producto_id` int4 no nulo — id de catálogo externo (si existe), o integra con sistema de productos.
+- `nombre_producto` varchar(100) no nulo.
+- `cantidad` int4 no nulo default 1.
+- `precio_unitario` numeric(10,2) no nulo.
+- `subtotal` numeric(12,2) no nulo.
+- `created_at` timestamptz no nulo.
+
+Relaciones:
+- N:1 con `TRANSACCIONES`.
+
+Ejemplo JSON:
+{
+  "id": 1,
+  "transaccion_id": 44,
+  "producto_id": 501,
+  "nombre_producto": "Servicio de VPN (1 año)",
+  "cantidad": 1,
+  "precio_unitario": 350.0,
+  "subtotal": 350.0,
+  "created_at": "2024-03-18T11:00:00Z"
+}
+
+## Tabla: ANALISIS_FRAUDE
+
+Breve: Resultados del scoring y análisis por modelo para una transacción.
+
+Campos:
+- `id` int4 PK, no nulo.
+- `transaccion_id` int4 FK→`TRANSACCIONES.id` ON DELETE CASCADE, ON UPDATE CASCADE.
+- `model_name` varchar(64) no nulo — p.ej. `FraudNet`.
+- `model_version` varchar(20) no nulo — p.ej. `v4.1`.
+- `framework` enum('PyTorch','scikit-learn') no nulo.
+- `score` int4 no nulo (0–100).
+- `is_fraud` bool no nulo.
+- `factors` text[] nulo — factores que influyeron (UI de alertas).
+- `metrics` jsonb nulo — `accuracy`, `precision`, `recall`, `f1`, `aucRoc`.
+- `analyzed_at` timestamptz no nulo.
+
+Relaciones:
+- N:1 con `TRANSACCIONES`.
+
+Ejemplo JSON:
+{
+  "id": 9001,
+  "transaccion_id": 44,
+  "model_name": "FraudNet",
+  "model_version": "v4.1",
+  "framework": "PyTorch",
+  "score": 91,
+  "is_fraud": true,
+  "factors": ["Monto Alto", "Geo-Inconsistencia"],
+  "metrics": {"accuracy":0.92,"precision":0.89,"recall":0.86,"f1":0.87,"aucRoc":0.94},
+  "analyzed_at": "2025-10-02T10:15:00Z"
+}
+
+## Tabla: ALERTA_REGISTROS
+
+Breve: Alertas derivadas de transacciones y análisis de fraude (priorizadas por `alertScore`).
+
+Campos:
+- `id` int4 PK, no nulo.
+- `transaccion_id` int4 FK→`TRANSACCIONES.id` ON DELETE CASCADE, ON UPDATE CASCADE.
+- `alert_score` int4 no nulo (0–100).
+- `status` enum('OPEN','REVIEWED','CLOSED') no nulo.
+- `factors` text[] nulo.
+- `created_at` timestamptz no nulo.
+- `updated_at` timestamptz no nulo.
+
+Relaciones:
+- N:1 con `TRANSACCIONES`.
+- 1:N con `ALERTA_AUDITORIAS` (auditoría por gestión de la alerta).
+
+Ejemplo JSON:
+{
+  "id": 7001,
+  "transaccion_id": 44,
+  "alert_score": 95,
+  "status": "OPEN",
+  "factors": ["IP Inusual","Dispositivo Desconfiable"],
+  "created_at": "2024-03-15T09:15:00Z",
+  "updated_at": "2024-03-15T09:20:00Z"
+}
+
+## Tabla: ALERTA_AUDITORIAS
+
+Breve: Historial de acciones de los usuarios sobre las alertas.
+
+Campos:
+- `id` int4 PK, no nulo.
+- `alerta_id` int4 FK→`ALERTA_REGISTROS.id` ON DELETE CASCADE, ON UPDATE CASCADE.
+- `usuario_id` varchar(16) FK→`REGISTRO_USUARIOS.id` ON DELETE RESTRICT, ON UPDATE CASCADE.
+- `accion` varchar(64) no nulo — p.ej. `Marcar como No-Fraude`, `Revisión Pendiente`.
+- `detalle` text nulo — comentarios.
+- `fecha` timestamptz no nulo.
+- `estado` enum('Éxito','Error') no nulo.
+
+Relaciones:
+- N:1 con `ALERTA_REGISTROS` y con `REGISTRO_USUARIOS`.
+
+Ejemplo JSON:
+{
+  "id": 8001,
+  "alerta_id": 7001,
+  "usuario_id": "u-002",
+  "accion": "Revisión Pendiente",
+  "detalle": "Escalar a analista senior",
+  "fecha": "2025-10-10T16:00:00Z",
+  "estado": "Éxito"
+}
+
+## Tabla: LOGS
+
+Breve: Bitácora general de sistema y componentes (incluye conexión DB, limpiezas, exportaciones, entrenamiento).
+
+Campos:
+- `id` int4 PK, no nulo.
+- `context_type` varchar(32) no nulo — p.ej. `DB`, `TRAINING`, `CLEANING`, `EXPORT`.
+- `context_id` varchar(64) nulo — id de sesión/proceso.
+- `message` text no nulo.
+- `level` enum('INFO','WARN','ERROR') no nulo.
+- `created_at` timestamptz no nulo.
+- `usuario_id` varchar(16) FK→`REGISTRO_USUARIOS.id` ON DELETE SET NULL, ON UPDATE CASCADE.
+
+Relaciones:
+- N:1 con `REGISTRO_USUARIOS` (opcional).
+
+Ejemplo JSON:
+{
+  "id": 11001,
+  "context_type": "DB",
+  "context_id": "ping-2025-10-17-0845",
+  "message": "Conexión a PostgreSQL establecida - OK",
+  "level": "INFO",
+  "created_at": "2025-10-17T08:25:12Z",
+  "usuario_id": null
+}
+
+## Tabla: AUDITORIA_SISTEMA
+
+Breve: Auditoría transversal de acciones en el sistema (UI Configuración).
+
+Campos:
+- `id` int4 PK, no nulo.
+- `usuario` varchar(120) no nulo — redundante para legibilidad histórica.
+- `usuario_id` varchar(16) FK→`REGISTRO_USUARIOS.id` ON DELETE SET NULL, ON UPDATE CASCADE.
+- `rol` enum('Administrador','Analista') no nulo.
+- `accion` varchar(120) no nulo.
+- `fecha` timestamptz no nulo.
+- `ip` varchar(45) nulo.
+- `estado` enum('Éxito','Error') no nulo.
+
+Relaciones:
+- N:1 con `REGISTRO_USUARIOS`.
+
+Ejemplo JSON:
+{
+  "id": 12001,
+  "usuario": "Juan Pérez",
+  "usuario_id": "u-001",
+  "rol": "Administrador",
+  "accion": "Entrenó modelo",
+  "fecha": "2025-10-16T17:25:00Z",
+  "ip": "192.168.1.10",
+  "estado": "Éxito"
+}
+
+## Tabla: DATOS_DESACTIVADOS
+
+Breve: Control de entidades desactivadas (usuarios, tarjetas, etc.).
+
+Campos:
+- `id` int4 PK, no nulo.
+- `entity_type` varchar(32) no nulo — `USUARIO`, `TARJETA`, `OTRO`.
+- `entity_id` varchar(32) no nulo.
+- `reason` varchar(160) nulo.
+- `deactivated_by` varchar(16) FK→`REGISTRO_USUARIOS.id` ON DELETE SET NULL, ON UPDATE CASCADE.
+- `deactivated_at` timestamptz no nulo.
+
+Relaciones:
+- N:1 con `REGISTRO_USUARIOS`.
+
+Ejemplo JSON:
+{
+  "id": 13001,
+  "entity_type": "USUARIO",
+  "entity_id": "u-004",
+  "reason": "Salida de la organización",
+  "deactivated_by": "u-001",
+  "deactivated_at": "2025-10-07T14:25:00Z"
+}
+
+## Tabla: DATOS_NULOS
+
+Breve: Monitoreo de calidad de datos (valores nulos/invalidos) en datasets de entrenamiento y tablas clave.
+
+Campos:
+- `id` int4 PK, no nulo.
+- `table_name` varchar(64) no nulo.
+- `column_name` varchar(64) no nulo.
+- `occurrences` int4 no nulo.
+- `last_detected_at` timestamptz no nulo.
+- `notes` text nulo.
+
+Ejemplo JSON:
+{
+  "id": 14001,
+  "table_name": "detalle_transacciones",
+  "column_name": "precio_unitario",
+  "occurrences": 3,
+  "last_detected_at": "2025-10-02T10:00:00Z",
+  "notes": "Imputación aplicada en limpieza"
+}
+
+## Tabla: ACCESO_FACIAL
+
+Breve: Sesiones y capturas del reconocimiento facial durante autenticación.
+
+Campos:
+- `id` int4 PK, no nulo.
+- `usuario_id` varchar(16) FK→`REGISTRO_USUARIOS.id` ON DELETE SET NULL, ON UPDATE CASCADE.
+- `image_b64` text nulo — captura en base64 o ruta.
+- `position` jsonb nulo — `{x: number, y: number, scale: number}`.
+- `status` varchar(64) no nulo — `Inicializando`, `Buscando rostro`, `Rostro listo`, etc.
+- `face_ready` bool no nulo.
+- `created_at` timestamptz no nulo.
+
+Ejemplo JSON:
+{
+  "id": 15001,
+  "usuario_id": "u-002",
+  "image_b64": null,
+  "position": {"x":0.51,"y":0.45,"scale":0.32},
+  "status": "Rostro listo",
+  "face_ready": true,
+  "created_at": "2025-10-12T12:00:00Z"
+}
+
+## Tabla: ACCESO_DNI
+
+Breve: Flujo de acceso manual por DNI y validación de código.
+
+Campos:
+- `id` int4 PK, no nulo.
+- `dni` varchar(8) no nulo.
+- `code_hash` varchar(128) nulo — referencia segura del código enviado.
+- `sent_at` timestamptz nulo.
+- `verified_at` timestamptz nulo.
+- `success` bool no nulo default false.
+- `ip` varchar(45) nulo.
+- `device_info` varchar(160) nulo.
+- `usuario_id` varchar(16) FK→`REGISTRO_USUARIOS.id` ON DELETE SET NULL, ON UPDATE CASCADE.
+
+Ejemplo JSON:
+{
+  "id": 16001,
+  "dni": "87654321",
+  "code_hash": "sha256:...",
+  "sent_at": "2025-10-12T09:00:00Z",
+  "verified_at": "2025-10-12T09:03:00Z",
+  "success": true,
+  "ip": "203.0.113.45",
+  "device_info": "Chrome/Windows",
+  "usuario_id": "u-002"
+}
+
+## Tabla: ENTRENAMIENTO_PYTORCH
+
+Breve: Metadatos, configuración y resultados de sesiones de entrenamiento en PyTorch.
+
+Campos:
+- `id` int4 PK, no nulo.
+- `model_name` varchar(64) no nulo.
+- `version` varchar(20) no nulo.
+- `hyperparams` jsonb nulo — epochs, lr, batch_size, etc.
+- `dataset_info` jsonb nulo — nombre, filas.
+- `metrics_final` jsonb nulo — accuracy/precision/recall/f1/auc.
+- `started_at` timestamptz no nulo.
+- `ended_at` timestamptz nulo.
+- `status` enum('EnCurso','Completado','Error') no nulo.
+- `usuario_id` varchar(16) FK→`REGISTRO_USUARIOS.id` ON DELETE SET NULL, ON UPDATE CASCADE.
+
+Relaciones:
+- 1:N con `LOGS` (contexto `TRAINING`).
+
+Ejemplo JSON:
+{
+  "id": 17001,
+  "model_name": "FraudNet",
+  "version": "v4.1",
+  "hyperparams": {"epochs":10,"lr":0.001},
+  "dataset_info": {"name":"DetalleTransacciones","rows":120000},
+  "metrics_final": {"accuracy":0.92,"precision":0.89,"recall":0.86,"f1":0.87,"aucRoc":0.94},
+  "started_at": "2025-10-02T10:00:00Z",
+  "ended_at": "2025-10-02T11:30:00Z",
+  "status": "Completado",
+  "usuario_id": "u-001"
+}
+
+## Tabla: ENTRENAMIENTO_SCKIT_LEARN
+
+Breve: Metadatos y configuración de sesiones en scikit-learn.
+
+Campos: (análogos a PyTorch)
+- `id` int4 PK, no nulo.
+- `model_name` varchar(64) no nulo.
+- `version` varchar(20) no nulo.
+- `hyperparams` jsonb nulo.
+- `dataset_info` jsonb nulo.
+- `metrics_final` jsonb nulo.
+- `started_at` timestamptz no nulo.
+- `ended_at` timestamptz nulo.
+- `status` enum('EnCurso','Completado','Error') no nulo.
+- `usuario_id` varchar(16) FK→`REGISTRO_USUARIOS.id` ON DELETE SET NULL.
+
+Ejemplo JSON:
+{
+  "id": 18001,
+  "model_name": "FraudNetSK",
+  "version": "v3.0",
+  "hyperparams": {"cv":5,"penalty":"l2"},
+  "dataset_info": {"name":"DetalleTransacciones","rows":80000},
+  "metrics_final": {"accuracy":0.90,"precision":0.86,"recall":0.84,"f1":0.85,"aucRoc":0.92},
+  "started_at": "2025-09-10T08:00:00Z",
+  "ended_at": "2025-09-10T08:45:00Z",
+  "status": "Completado",
+  "usuario_id": "u-001"
+}
+
+## Tabla: REPORTES
+
+Breve: Reportes generados (CSV, gráficos, auditorías).
+
+Campos:
+- `id` int4 PK, no nulo.
+- `type` varchar(32) no nulo — `AUDIT_CSV`, `FRAUD_CHART`, etc.
+- `params` jsonb nulo — filtros o rango temporal.
+- `file_path` text nulo — ubicación del archivo exportado.
+- `generated_by` varchar(16) FK→`REGISTRO_USUARIOS.id` ON DELETE SET NULL.
+- `generated_at` timestamptz no nulo.
+- `status` enum('OK','ERROR') no nulo.
+
+Ejemplo JSON:
+{
+  "id": 19001,
+  "type": "AUDIT_CSV",
+  "params": {"desde":"2025-10-10","hasta":"2025-10-17"},
+  "file_path": "/exports/audit-logs-2025-10-17.csv",
+  "generated_by": "u-001",
+  "generated_at": "2025-10-17T09:10:00Z",
+  "status": "OK"
+}
+
+## Tabla: LISTA_TAREAS
+
+Breve: Gestión de tareas y pendientes por usuario (UI Perfil/Pendientes).
+
+Campos:
+- `id` int4 PK, no nulo.
+- `titulo` varchar(120) no nulo.
+- `descripcion` text nulo.
+- `assigned_to` varchar(16) FK→`REGISTRO_USUARIOS.id` ON DELETE SET NULL.
+- `prioridad` enum('Baja','Media','Alta') no nulo.
+- `estado` enum('Abierta','EnProgreso','Cerrada') no nulo.
+- `due_date` timestamptz nulo.
+- `created_at` timestamptz no nulo.
+
+Ejemplo JSON:
+{
+  "id": 20001,
+  "titulo": "Revisar alerta crítica #7001",
+  "descripcion": "Verificar factores y marcar decisión",
+  "assigned_to": "u-002",
+  "prioridad": "Alta",
+  "estado": "Abierta",
+  "due_date": "2025-10-18T18:00:00Z",
+  "created_at": "2025-10-17T12:00:00Z"
+}
+
+## Tabla: RENDIMIENTO
+
+Breve: KPIs y métricas agregadas del dashboard por rango temporal.
+
+Campos:
+- `id` int4 PK, no nulo.
+- `timestamp` timestamptz no nulo.
+- `time_range` enum('24h','7d','30d') no nulo.
+- `total_transactions` int4 no nulo.
+- `fraud_rate` numeric(5,2) no nulo — %.
+- `false_positive_rate` numeric(5,2) nulo — %.
+- `average_model_score` numeric(5,2) nulo.
+- `is_fraud_rate_high` bool no nulo.
+
+Ejemplo JSON:
+{
+  "id": 21001,
+  "timestamp": "2025-10-17T12:00:00Z",
+  "time_range": "24h",
+  "total_transactions": 12000,
+  "fraud_rate": 2.45,
+  "false_positive_rate": 0.85,
+  "average_model_score": 72.5,
+  "is_fraud_rate_high": false
+}
+
+## Tabla: DATOS_ELIMINADOS
+
+Breve: Trazabilidad de borrados lógicos/físicos.
+
+Campos:
+- `id` int4 PK, no nulo.
+- `entity_type` varchar(32) no nulo.
+- `entity_id` varchar(32) no nulo.
+- `deleted_by` varchar(16) FK→`REGISTRO_USUARIOS.id` ON DELETE SET NULL.
+- `deleted_at` timestamptz no nulo.
+- `reason` varchar(160) nulo.
+- `previous_values` jsonb nulo — snapshot previo.
+
+Ejemplo JSON:
+{
+  "id": 22001,
+  "entity_type": "ALERTA",
+  "entity_id": "7001",
+  "deleted_by": "u-001",
+  "deleted_at": "2025-10-18T09:30:00Z",
+  "reason": "Duplicada",
+  "previous_values": {"status":"OPEN","alert_score":95}
+}
+
+---
+
+## Relaciones clave (diagrama verbal)
+
+- `REGISTRO_USUARIOS (1:N) TARJETAS`
+- `REGISTRO_USUARIOS (1:N) TRANSACCIONES`
+- `TARJETAS (1:N) TRANSACCIONES`
+- `TRANSACCIONES (1:N) DETALLE_TRANSACCIONES`
+- `TRANSACCIONES (1:N) ALERTA_REGISTROS`
+- `ALERTA_REGISTROS (1:N) ALERTA_AUDITORIAS`
+- `TRANSACCIONES (1:N) ANALISIS_FRAUDE`
+- `REGISTRO_USUARIOS (1:N)` {`AUDITORIA_SISTEMA`, `LOGS`, `REPORTES`, `LISTA_TAREAS`, `ENTRENAMIENTO_*`, `ACCESO_*`}
+
+## Reglas ON DELETE / ON UPDATE
+
+- Usuarios (`REGISTRO_USUARIOS`): `ON DELETE RESTRICT` en `TARJETAS` y `TRANSACCIONES`; `SET NULL` en entidades históricas (`LOGS`, `AUDITORIA_SISTEMA`, `REPORTES`, `ACCESO_*`, `ENTRENAMIENTO_*`, `LISTA_TAREAS`). `ON UPDATE CASCADE` general.
+- Tarjetas: `ON DELETE SET NULL` en `TRANSACCIONES` para preservar histórico; cascade en `DETALLE_TRANSACCIONES` solo hacia `TRANSACCIONES`.
+- Transacciones: `ON DELETE CASCADE` en `DETALLE_TRANSACCIONES`, `ANALISIS_FRAUDE`, `ALERTA_REGISTROS`.
+- Alertas: `ON DELETE CASCADE` en `ALERTA_AUDITORIAS`.
+
+## Observaciones de seguridad y datos sensibles
+
+- Evitar almacenar PAN completo y CVV en `TARJETAS`. Usar tokenización si se integra con PSP.
+- Registrar IP y `device_info` en `ACCESO_DNI` para trazabilidad.
+- Mantener en `LOGS` solo mensajes no sensibles; para errores incluir IDs de contexto y evitar datos personales.
+- Auditoría (`AUDITORIA_SISTEMA`) debe ser append-only.
+
+## Notas de implementación
+
+- Crear enums como tipos nativos en PostgreSQL o constraints `CHECK` si RDBMS distinto.
+- Indexar: `TRANSACCIONES(fecha_hora)`, `ALERTA_REGISTROS(alert_score DESC)`, `DETALLE_TRANSACCIONES(transaccion_id)`, `AUDITORIA_SISTEMA(fecha)`, `LISTA_TAREAS(assigned_to, estado)`.
+- Particionamiento opcional por fecha en `TRANSACCIONES` y `ALERTA_REGISTROS` para grandes volúmenes.

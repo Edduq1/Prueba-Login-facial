@@ -1,0 +1,158 @@
+# Documentación Backend (Django + Django REST Framework)
+
+Esta guía define la lógica y API REST necesarias para reemplazar la simulación actual del frontend, alineada con el flujo, vistas y cambios solicitados.
+
+## 1. Flujo general del proyecto
+- Autenticación: flujo multi-etapas (login inicial → reconocimiento facial → ingreso DNI → código manual → éxito). El estado se persiste en `localStorage` y habilita rutas protegidas.
+- Routing: `BrowserRouter` + rutas protegidas. Al autenticarse se accede a `Dashboard` y subsecciones: Transacciones, Alertas, Modelos, Configuración, Perfil.
+- Layout: `MainLayout` con `Sidebar`, `Header` (notificaciones, usuario), `Footer` y `Outlet` para contenido.
+- Dashboard: KPIs y gráficos (tasa de fraude y distribución de score) dependientes de rango temporal.
+- Transacciones: exploración con búsqueda, filtros, paginación, detalle, acciones (marcar pagado, rechazar) y exportación.
+- Alertas: listado con filtros por riesgo y vista detallada (factores, monto, contexto). Simulación de críticas vía WebSocket.
+- Modelos: ciclo de limpieza de datos, entrenamiento (PyTorch y Sklearn), métricas, historial y exportación.
+- Configuración: gestión de usuarios, estado de BD, auditoría, parámetros faciales, preferencias de visualización.
+- Perfil: panel personal con KPIs, calendario, tareas y perfil del usuario; subida de avatar que debe refrescar cabecera.
+
+## 2. Descripción de vistas
+- Login
+  - Componentes: pasos de autenticación, reconocimiento facial, DNI, código.
+  - Acciones: iniciar sesión, validar identidad, persistir sesión.
+- Dashboard
+  - Componentes: `KPISection`, `FraudRateChart`, `ScoreDistributionChart`, `TimeRangeSelector`.
+  - Acciones: cambiar rango, cargar métricas.
+- Transacciones
+  - Componentes: búsqueda, `StatusDropdown`, `EtiquetaDropdown`, `TransactionFiltersModal`, `TransactionDetailModal`, `RiskBadge`, `StatusTag`.
+  - Datos: lista paginada, filtros (estado y tipo pago), detalle con productos y voucher.
+  - Acciones: ver detalle, marcar como pagado, rechazar (genera alerta), exportar Excel.
+  - Cambios solicitados: nueva tabla con campos específicos; filtros por estado y tipo pago; exportar Excel.
+- Alertas
+  - Componentes: `AlertFilters`, `AlertCard`, `AlertDetalle`.
+  - Datos: score, monto, fecha, cuenta, país, tipo comercio, factores.
+  - Acciones: ver detalle, cerrar/reabrir, enviar mensaje personalizado al cliente.
+  - Cambios solicitados: filtro por fecha, cambiar emoji de riesgo, eliminar estado en detalle, icono inbox en cierre.
+- Modelos
+  - Componentes: limpieza, entrenamiento, informes; tablas y gráficos (ROC y Precision–Recall).
+  - Acciones: ejecutar limpieza, entrenar (PyTorch/Sklearn), ver métricas, exportar modelo.
+  - Cambios solicitados: botón actualizar datos tabla; estructura de tabla con campos definidos; usar ROC y PR; eliminar acciones en historial.
+- Configuración
+  - Componentes: gestión de usuarios, estado BD, auditoría, preferencias.
+  - Acciones: CRUD usuarios, validar DNI/email, probar conexión BD, ver logs y tendencias, configurar parámetros faciales X/Y.
+  - Cambios solicitados: quitar estado en tablas, extender visualización por página, acomodar contenedores simétricamente, gráficos de tendencias y vistas por rol.
+- Perfil
+  - Componentes: KPIs personales, calendario, tareas, perfil usuario.
+  - Acciones: subir avatar (refresca header), crear tareas vinculadas al header.
+  - Cambios solicitados: renombrar vista, nuevos KPIs, ajuste simétrico de componentes y modales, actualizar datos de tarjetas de soporte/HR.
+
+## 3. API REST recomendada (base `/api/v1`)
+
+### Autenticación
+- POST `/auth/login` { username, password | dni, code | facialToken }
+  - Respuesta: { token, user: { id, nombre, rol } }
+- POST `/auth/logout`
+- GET `/auth/me` → usuario autenticado
+
+### Dashboard
+- GET `/dashboard/kpis?range=24h|7d|30d`
+  - Respuesta: { totalTransacciones, tasaFraude, montoTotal, alertasActivas }
+- GET `/dashboard/fraud-rate?range=...`
+  - Respuesta: [{ timestamp, tasa }]
+- GET `/dashboard/score-distribution?range=...`
+  - Respuesta: { bins: [{ scoreMin, scoreMax, count }] }
+
+### Transacciones
+- GET `/transactions`
+  - Query: `page`, `page_size`, `q`, `estado`(pendiente|rechazado|pagado), `tipo_pago`(yape|plin|tarjeta), `riesgo_min`, `riesgo_max`, `fecha_desde`, `fecha_hasta`.
+  - Respuesta: { results: [{ numero, fecha, cliente, tipo_pago, estado, total_pago, riesgo }], page, page_size, total }
+- GET `/transactions/{id}`
+  - Respuesta: { numero, fecha, cliente, tipo_pago, estado, total_pago, riesgo, productos: [{ producto, cantidad, precio_unitario, subtotal }], voucher_url?, decision_history: [{ fecha, accion, usuario }] }
+- POST `/transactions/{id}/mark-paid`
+  - Respuesta: { id, estado:"pagado", updated_at }
+- POST `/transactions/{id}/reject` { motivo }
+  - Respuesta: { id, estado:"rechazado", alerta_creada: { alert_id } }
+- GET `/transactions/export` (mismas query)
+  - Respuesta: archivo Excel (`Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`)
+
+### Alertas
+- GET `/alerts`
+  - Query: `page`, `page_size`, `riskLevel`(low|medium|high), `fecha_desde`, `fecha_hasta`, `q`.
+  - Respuesta: { results: [{ id, cuenta, monto_total, pais, tipo_comercio, fecha_hora, alertScore }], page, total }
+- GET `/alerts/{id}`
+  - Respuesta: { id, cuenta, monto_total, pais, tipo_comercio, fecha_hora, alertScore, factors:[], ip_origen?, id_transaccion?, usuario_afectado?, descripcion_corta?, suggested_message? }
+- POST `/alerts/{id}/send-message` { message }
+  - Respuesta: { sent: true, delivered_at }
+- POST `/alerts/{id}/close`
+  - Respuesta: { id, closed: true }
+- WS `/alerts/stream` → push de alertas críticas (score≥highScore)
+
+### Modelos
+- GET `/models/active`
+  - Respuesta: { id, status, metrics: { auc, accuracy, precision, recall }, framework }
+- GET `/models/data`
+  - Respuesta: { results: [{ cliente, tipo_pago, producto, cantidad, precio_unitario, subtotal, fecha_transaccion }], page, total }
+- POST `/models/clean` { steps[] }
+  - Respuesta: { job_id }
+- POST `/models/train` { framework:"pytorch"|"sklearn", params:{} }
+  - Respuesta: { job_id }
+- GET `/jobs/{job_id}`
+  - Respuesta: { status:"queued|running|failed|done", logs:[] }
+- GET `/models/metrics`
+  - Respuesta: { roc: [{ fpr, tpr }], pr: [{ recall, precision }], confusion?:{ tp, fp, tn, fn } }
+- GET `/models/history`
+  - Respuesta: { results: [{ id, created_at, framework, metrics }]} (sin campo acciones)
+- GET `/models/export`
+  - Respuesta: archivo binario/JSON del modelo según framework
+
+### Configuración
+- Usuarios
+  - GET `/users` (paginado + filtros `rol`, `q`)
+  - POST `/users` { nombres, apellidos, dni, email, rol }
+  - PUT `/users/{id}` { ... }
+  - DELETE `/users/{id}`
+  - GET `/users/dni/{dni}` → validación y datos
+- Preferencias y parámetros
+  - GET `/preferences` → { page_size, layout_symmetry }
+  - PUT `/preferences` → actualizar visualización por página/simetría
+  - GET `/facial/params` → { x, y }
+  - PUT `/facial/params` { x, y }
+- Base de datos
+  - GET `/db/status` → { engine, host, latency_ms, ok }
+  - POST `/db/test-connection` → { ok, details }
+  - GET `/db/tables` → listado y métricas (sin campo estado)
+- Auditoría
+  - GET `/audit/logs` (filtros: `user`, `action`, `fecha_desde`, `fecha_hasta`, `page`)
+  - GET `/audit/trends` → series de tiempo por acción
+  - GET `/audit/views-by-role` → agregados de vistas por rol
+
+### Perfil
+- GET `/profile/me`
+  - Respuesta: { id, nombre, email, avatarUrl, rol, kpis: { transacciones_aprobadas, tareas_pendientes, alertas_manejadas } }
+- POST `/profile/avatar` (multipart)
+  - Respuesta: { avatarUrl, refreshed:true }
+- Tareas
+  - GET `/tasks` (del usuario)
+  - POST `/tasks` { titulo, fecha, prioridad }
+- Soporte y RRHH
+  - GET `/support/cards` → datos actualizados de soporte
+  - GET `/hr/cards` → datos actualizados de RRHH
+
+## 4. Consideraciones técnicas Django
+- DRF + JWT: usar `djangorestframework-simplejwt` para emisión/validación de tokens.
+- Paginación: `PageNumberPagination` con `page_size` configurable desde `/preferences`.
+- Filtros: `django-filter` para campos y rangos; validaciones de enums.
+- Exportación Excel: generar con `openpyxl` o `pandas`, streaming de respuesta.
+- WebSocket: usar `django-channels` para stream de alertas críticas.
+- Entrenamiento: orquestar jobs con Celery + Redis; persistir logs/estado de `jobs`.
+- Métricas modelo: calcular ROC/PR en backend con `sklearn.metrics`, exponer arrays compactos.
+- Subida de archivos: `multipart/form-data` para voucher y avatar; almacenar en S3/MinIO o filesystem.
+
+## 5. Mapeo de cambios solicitados
+- Transacciones: nueva lista con campos requeridos, filtros por estado/tipo pago, detalle con productos y voucher; acciones `mark-paid` y `reject` (crea alerta); exportar Excel.
+- Alertas: filtros por fecha; eliminar campo estado en detalle; icono inbox en UI; endpoint para mensaje personalizado.
+- Modelos: tabla con campos definidos; botón actualizar datos (GET `/models/data`); gráficos ROC y PR; historial sin acciones.
+- Configuración: quitar estado en tablas; parámetros faciales X/Y; mayor `page_size`; tendencias y vistas por rol.
+- Perfil: renombrar vista; KPIs específicos; al subir avatar, devolver `refreshed:true` para forzar actualización del header; modales/tareas alineadas.
+
+## 6. Esquemas de respuesta (ejemplos breves)
+- Transacción básica: `{ numero:"TRX-2024-0001", fecha:"2025-10-23T13:45:00Z", cliente:"Juan Perez", tipo_pago:"yape", estado:"pendiente", total_pago:120.50, riesgo:78 }`
+- Detalle transacción: `{ ... , productos:[{ producto:"Zapatillas", cantidad:2, precio_unitario:150, subtotal:300 }], voucher_url:"https://.../voucher.png" }`
+- Alerta: `{ id:12, cuenta:"Cuenta-001", monto_total:580, pais:"PE", tipo_comercio:"Moda", fecha_hora:"2025-10-22T18:00:00Z", alertScore:92, factors:["IP sospechosa","Patrón inusual"] }`
